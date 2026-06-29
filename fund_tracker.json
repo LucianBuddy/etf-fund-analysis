@@ -1,0 +1,28 @@
+[
+  {
+    "code": "510300",
+    "name": "沪深300ETF",
+    "date": "2026-06-26",
+    "size_yi": 350,
+    "prem_pct": 0.15,
+    "track_err": null
+  },
+  {
+    "code": "000001",
+    "name": "测试基金",
+    "date": "2026-06-26",
+    "size_yi": 100,
+    "prem_pct": 0.1,
+    "track_err": null,
+    "style": "价值"
+  },
+  {
+    "code": "000001",
+    "name": "测试基金",
+    "date": "2026-06-26",
+    "size_yi": 95,
+    "prem_pct": 0.2,
+    "track_err": null,
+    "style": "成长"
+  }
+]

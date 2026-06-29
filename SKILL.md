@@ -1,12 +1,31 @@
 ---
 name: etf-fund-analysis
 description: A股场内基金/ETF/LOF分析。当用户请求基金分析、ETF评估、基金持仓、费率对比、基金业绩时触发。
-version: 1.0.0
+version: 2.2.0
+changelog: CHANGELOG.md
 ---
 
-# etf-fund-analysis — 基金/ETF分析 v1.0.0
+# etf-fund-analysis — 基金/ETF分析 v2.2.0
 
-当用户请求 **基金分析、ETF评估、基金持仓、基金业绩** 时按此 SKILL 执行。个股分析走 `magnus-secular-analysis`（长线）或 `temp-omni-analysis`（短线）。
+当用户请求 **基金分析、ETF评估、基金持仓、基金业绩** 时按此 SKILL 执行。
+
+---
+
+## scripts/ 模块说明（v2.0.0 新增）
+
+本技能自建 Python 模块层，替代外部依赖：
+
+| 模块 | 路径 | 功能 |
+|------|------|------|
+| fund_data | `scripts.fund_data` | 基金行情/折溢价/类型/风格判断（腾讯API，零外部依赖） |
+| scoring | `scripts.scoring` | ETF 5项质量评分（费率/跟踪误差/规模/折溢价/流动性） |
+| cache | `scripts.cache` | 文件缓存（行情5min/基金1h/持仓24h） |
+| holdings | `scripts.holdings` | 持仓风险分析（集中度/风格/高PE/亏损股检测） |
+| peer | `scripts.peer` | 同类ETF自动对比（ETF_PEER_MAP + compare_peers） |
+| tracker | `scripts.tracker` | v2.2.0 追踪记录与预警（规模/折溢价/风格漂移检测） |
+| screener | `scripts.screener` | v2.1.0 批量ETF筛选（screen_etfs / screen_category） + LOF套利信号 |
+| fund_info | `scripts.fund_data.try_fetch_fund_info` | v2.2.0 净值/费率尽力获取（腾讯+天天基金双通道） |
+| dca | `scripts.fund_data.dca_simulate` | v2.2.0 定投回算器（月投/总额/收益率/年化/vs一次性） |
 
 ---
 
@@ -46,7 +65,8 @@ version: 1.0.0
 
 | 数据项 | 优先级 | 获取方式 | fallback | 装载量 |
 |-------|-------|---------|---------|--------|
-| 基金名称/代码/类型 | P0 | `tencent_quote([code])` 取名称+价格+涨跌 | 无 | 1条 |
+| 基金名称/代码/类型 | P0 | `scripts.fund_data.tencent_quote([code])` 取名称+价格+涨跌 | 无 | 1条 |
+| 净值/费率 | P1 | `scripts.fund_data.try_fetch_fund_info(code)` 尽力获取净值（腾讯+天天基金双通道） | 数据不可用时直接标注 | 1条 |
 | 场内价与涨跌幅 | P0 | 同上 腾讯索引3/32 | 无 | 2数值 |
 | 基金规模(亿)/份额 | P1 | 天天基金/东财基金API 取净值规模 | 标注不可用 | 1数值 |
 | 管理费/托管费 | P1 | 天天基金费率页 或 基金公告 | 标注不可用 | 2数值 |
@@ -63,12 +83,12 @@ version: 1.0.0
 | 指数成分股特征 | 天天基金指数页或`web_fetch("指数名 成分股")` | 如"石油石化~80%+煤炭~20%" |
 | 跟踪误差 | 年报季报中的跟踪偏离度 | 越小越好(<0.2%为优) |
 | 净值(NAV) | 天天基金ETF净值页 或 `web_fetch("基金代码 净值")`取最新净值 | 腾讯报价不提供净值 |
-| 折溢价率 | `(场内价 - 净值) / 净值 × 100` | 溢价>1%需警惕，折价>1%可关注 |
+| 折溢价率 | `scripts.fund_data.calc_premium(price, nav)` | 溢价>1%需警惕，折价>1%可关注 |
 | 近1月/3月/1年收益 | 天天基金业绩页 或 从K线数据自行计算区间收益率 | 需净值复权计算 |
 | 分红记录 | 天天基金分红页 或 基金公告 | 年化分红率参考 |
 | 最大回撤/波动率 | 天天基金风险分析页 或 从60日K线计算 | 可估算短期波动 |
 | 重仓股TOP10 | 天天基金持仓页 `shc` 接口或 `web_fetch("基金代码 持仓")` | 判断风格和集中度 |
-| 同类ETF对比 | `tencent_quote([同类ETF代码])` | 规模/费率/换手率对比 |
+| 同类ETF对比 | `scripts.fund_data.tencent_quote([同类ETF代码])` | 规模/费率/换手率对比 |
 
 ### 通道 W — Wiki（强制）
 
@@ -86,35 +106,76 @@ version: 1.0.0
 
 ## 📐 数据摘要（Step 1.5）
 
+### 调用 scripts/ 模块整理数据
+
+```python
+from scripts.fund_data import tencent_quote, summarize_fund_data, calc_premium, classify_style, classify_fund_type
+
+# 获取行情
+quote_result = tencent_quote([code])
+
+# 生成摘要
+summary = summarize_fund_data(quote_result, code)
+
+# 计算折溢价（需要nav来自其他数据源）
+prem_pct = calc_premium(price, nav)
+
+# 判断基金类型
+ftype = classify_fund_type(code)
+```
+
+### v2.1.0 新增 — 从K线数据计算收益与风险指标
+
+```python
+from scripts.fund_data import compute_all_metrics
+
+# bars 从百度K线API获取（详见上方通道A说明）
+# bars = [{"close": 1.0}, {"close": 1.01}, ...]
+metrics = compute_all_metrics(bars)
+
+# metrics 返回:
+# {
+#   "ret_1m": 2.35,          # 近1月收益(%)
+#   "ret_3m": 5.12,          # 近3月收益(%)
+#   "ret_1y": 15.80,         # 近1年收益(%)
+#   "max_drawdown": 8.50,    # 最大回撤(%)
+#   "annual_volatility": 18.5,  # 年化波动率(%)
+#   "sharpe_approx": 0.85,   # 夏普比率
+#   "n_bars": 300,
+#   "detail": "..."
+# }
+```
+
 ### 进上下文的紧凑结构
 
 ```python
 fund = {
     # 基本信息
-    "code":"","name":"","type":"ETF",  # type:ETF/LOF/主动/货币
-    "price":0.0,"nav":0.0,"prem_pct":0.0,
-    "size_yi":0.0,"mgmt_fee":0.0,"cust_fee":0.0,
+    "code":"", "name":"", "type":"ETF",  # type:ETF/LOF/主动/货币
+    "price":0.0, "nav":0.0, "prem_pct":0.0,
+    "size_yi":0.0, "mgmt_fee":0.0, "cust_fee":0.0,
+    "total_fee": 0.0,
     "turnover":0.0,
-    
+
     # 业绩
-    "ret_1m":0.0,"ret_3m":0.0,"ret_1y":0.0,"ret_3y":0.0,
-    "rank_pct":0.0,"max_drawdown":0.0,"div_yield":0.0,
-    
+    "ret_1m":0.0, "ret_3m":0.0, "ret_1y":0.0, "ret_3y":0.0,
+    "rank_pct":0.0, "max_drawdown":0.0, "div_yield":0.0,
+
     # ETF特有
-    "index_name":"","track_err":0.0,
+    "index_name":"", "track_err":0.0,
     "peers":[],
-    
+
     # 持仓
-    "holdings":[],"holding_top_pct":0.0,
-    "holdings_scanned":[],  # 已扫描[{"code","pe","pb","chg","note"}] note="海外股暂缺"等
+    "holdings":[], "holding_top_pct":0.0,
+    "holdings_scanned": [],  # 已扫描[{"code","pe","pb","chg","note"}]
     "industry_dist":{},
-    
+
     # 主动特有
-    "manager":"","mgr_years":0,"mgr_size":0.0,
+    "manager":"", "mgr_years":0, "mgr_size":0.0,
     "style":"",
-    
+
     # 元数据
-    "ts":"","src":"","n_ok":False,
+    "ts":"", "src":"", "n_ok":False,
 }
 ```
 
@@ -122,7 +183,7 @@ fund = {
 
 ```python
 # 折溢价
-prem = (price - nav) / nav * 100 if nav > 0 else 0
+prem = calc_premium(price, nav)
 fund["prem_pct"] = round(prem, 2)
 
 # 总费率
@@ -139,18 +200,33 @@ if fund["holdings"]:
 
 ### 2-A ETF质量（ETF类型必做）
 
-```
-跟踪误差 < 0.2% → 优  /  0.2-0.5% → 可接受  /  >0.5% → 差
-总费率(管理+托管) < 0.2% → 低  /  0.2-0.5% → 中  /  >0.5% → 高
-规模 > 50亿 → 大(流动性好)  /  10-50亿 → 中  /  <10亿 → 小(注意流动性)
+使用 `scripts.scoring.score_etf_quality()` 自动评分：
 
-**换手率折算**：if 规模<10亿：换手率高可能虚高（规模过小导致），比较时优先看日均成交额绝对值而非换手率%。
-折溢价 |<1%| → 正常  /  >1% → 溢价偏高  /  <-1% → 折价(有机会)
+```python
+from scripts.scoring import score_etf_quality
+
+quality = score_etf_quality(fund)
+
+# quality 返回:
+# {"total_score": 4, "max_score": 5,
+#  "details": {
+#    "费率": {"score": 1, "label": "低", "value": 0.15},
+#    "跟踪误差": {"score": 1, "label": "小", "value": 0.1},
+#    "规模": {"score": 1, "label": "大", "value": 350},
+#    "折溢价": {"score": 1, "label": "正常", "value": 0.15},
+#    "流动性": {"score": 1, "label": "好", "value": 2.5},
+#  },
+#  "verdict": "推荐"}
 ```
 
-**总评分**（5项加权，满分5分）：
+评分标准（5项，满分5分）：
 ```
-费率低+1 / 跟踪误差小+1 / 规模大+1 / 折溢价正常+1 / 换手率>1%+1
+费率 < 0.2% → +1  /  0.2-0.5% → 0  /  >=0.5% → -1
+跟踪误差 < 0.2% → +1  /  0.2-0.5% → 0  /  >=0.5% → -1
+规模 > 50亿 → +1  /  10-50亿 → 0  /  <=10亿 → -1
+折溢价 |%| < 1% → +1  /  其他 → -1
+换手率>1%或成交额>5000万 → +1  /  其他 → 0
+
 ≥4分 → 推荐  /  3分 → 可考虑  /  ≤2分 → 不推荐
 ```
 
@@ -160,11 +236,11 @@ if fund["holdings"]:
 - 分红年化率：ETF分红频率和金额（通常年中/年末分配）
 
 **持仓风格判断**（有重仓股时执行）：
-- 根据TOP10重仓股判断风格（成长/价值/均衡）
+- 使用 `scripts.fund_data.classify_style(holdings_pe_list)` 判断风格（价值/均衡/成长）
 - 单只重仓股>15%为集中，>20%为高度集中
 - 行业分布宽窄：是否集中在单一行业
 
-### 2-B 主动基金质量（主动类型必做）
+### 2-B LOF / 主动基金质量（主动或LOF类型必做）
 
 ```
 基金经理任职 > 3年 → 经验丰富  /  1-3年 → 中等  /  <1年 → 新上任
@@ -173,7 +249,35 @@ if fund["holdings"]:
 同类排名连续3年在前1/3 → 持续的
 ```
 
+#### LOF折溢价套利信号（v2.1.0 新增）
+
+LOF类型时，使用 `scripts.fund_data.lof_arbitrage_signal()` 检测套利机会：
+
+```python
+from scripts.fund_data import lof_arbitrage_signal
+
+sig = lof_arbitrage_signal(prem_pct, turnover_pct, amount_wan)
+# sig.signal: "溢价套利" / "折价套利" / "无机会"
+# sig.confidence: "高" / "中" / "低"
+# sig.net_return: 扣成本后净收益
+# sig.liquidity_ok: 流动性是否满足
+```
+
 ### 2-C 持仓分析与重仓股扫描（必做）
+
+使用 `scripts.holdings.holdings_risk_analysis()` 自动化分析：
+
+```python
+from scripts.holdings import holdings_risk_analysis
+
+# 将TOP10重仓股整理为 holdings 格式
+# holdings = [{"name": "股票A", "pct": 8.5, "pe": 31, "industry": "消费电子"}, ...]
+
+risk = holdings_risk_analysis(holdings)
+# 返回: top1_pct, top3_pct, top3_names, industry_dist,
+#       concentration_risk, has_high_pe, has_negative_pe,
+#       style, detail (一段完整描述文本)
+```
 
 **重仓股列表输出**（输出到报告中）：
 ```
@@ -184,9 +288,20 @@ TOP10重仓股：
 ```
 
 **批量扫描**：调用 `tencent_quote([股票代码列表])` 一次性获取所有重仓股的PE/PB/市值/当日涨跌幅。
-**跨市场处理**：A股用tencent_quote；港股/美股重仓股（代码含.HK/.US等）无法获取时，标注"海外上市股数据暂缺"并跳过该股扫描。
+**跨市场处理**：A股用 tencent_quote；港股/美股重仓股（代码含.HK/.US等）无法获取时，标注"海外上市股数据暂缺"并跳过该股扫描。
 
-**组合风格判断**：
+**组合风格判断**（由 `holdings_risk_analysis` 自动完成）：
+
+**风格漂移检测**（v2.2.0，主动基金类型选做）：
+```python
+from scripts.tracker import check_style_drift
+
+sd = check_style_drift(code, current_style="价值")
+# sd.drift_detected: 是否发生漂移
+# sd.style_history: 历史风格序列
+# sd.detail: 完整描述（"风格稳定"或"检测到风格漂移(价值→成长)"）
+```
+通过 `track_fund()` 的 `style` 参数每次分析时记录当前风格，累积后可用于判断风格漂移。
 - 按重仓股PE中位数：<20=价值 / 20-40=均衡 / >40=成长
 - 按行业集中度：Top3行业>60%=集中 / 30-60%=适中 / <30%=分散
 - 按单只上限：>20%=高度集中风险 / 10-20%=适度 / <10%=分散
@@ -203,12 +318,19 @@ TOP10重仓股：
 
 ### 3-A 同类ETF对比（ETF类型必做）
 
-从同类ETF列表中获取数据源：`tencent_quote([同类ETF代码])` 批量拉取规模/换手率，并通过通道A未完成的基金数据源补充费率和跟踪误差。
+使用 `scripts.peer.compare_peers()` 自动对比：
 
-### 3-B 指数涨跌归因（有数据时执行）
+```python
+from scripts.peer import get_peers, compare_peers
 
-if 指数当日涨幅>1%或跌幅>1%:
-    搜索"指数名 上涨/下跌 原因" → 在报告中归因
+# 获取同类代码列表
+peer_codes = get_peers(fund_code)
+
+if peer_codes:
+    # 执行批量对比
+    comparison = compare_peers(fund_code, peer_codes)
+    # 返回 comparison_table, peer_avg_scale, fund_rank_position, best_peer
+```
 
 | 对比项 | 本基金 | 同类最优 | 同类中位 |
 |-------|-------|---------|---------|
@@ -222,14 +344,46 @@ if 指数当日涨幅>1%或跌幅>1%:
 
 **同类最优推荐**：在同类对比结论中增加—if 本基金不是同类中规模最大：输出"同类最优：{最优基金代码}({规模}亿)"。
 
-
 **对比维度扩展**（有数据时一并对比）：
 - 近1年收益 vs 基准跟踪偏离度
 - 日均成交额（亿）
 - 近1年最大回撤
 - 成立以来年化收益率
 
+### 3-B 指数涨跌归因（有数据时执行）
+
+if 指数当日涨幅>1%或跌幅>1%:
+    搜索"指数名 上涨/下跌 原因" → 在报告中归因
+
 ### 3-C 同类主动基金对比（主动类型选做）
+
+---
+
+## Step 3.5：追踪记录与预警检查（v2.0.0 新增）
+
+每次分析完成后，记录快照并检查预警：
+
+```python
+from scripts.tracker import track_fund, check_alerts
+
+# 记录本次分析
+track_fund(code, name, size_yi, prem_pct, track_err=track_err)
+
+# 检查历史上是否有需要预警的风险
+alerts = check_alerts(code, lookback_days=90)
+# alerts 返回 [{"type": "规模萎缩预警", "severity": "高", "detail": "..."}, ...]
+
+# 将预警信息输出到报告中
+if alerts:
+    print("### ⚠ 预警提示")
+    for a in alerts:
+        print(f"- [{a['severity']}] {a['type']}: {a['detail']}")
+```
+
+**预警类型**：
+1. 规模连续3次下降且累计>20% → "规模萎缩预警"（高）
+2. 最近一次折溢价>2% → "折溢价异常预警"（高/中）
+3. 跟踪误差>0.5% → "跟踪误差预警"（中）
 
 ---
 
@@ -255,6 +409,9 @@ TOP10集中度：{holding_top_pct}%
 ### 同类排名
 {同类对比结果}
 
+### 预警（若有）
+{预警信息}
+
 ### 结论
 - {推荐/可考虑/不推荐}
 - 适用场景：{适合什么类型的投资者}
@@ -265,6 +422,35 @@ TOP10集中度：{holding_top_pct}%
 > 数据来源：{sources} 获取时间：{ts}
 > 缺失数据：{缺失项列表}
 ```
+
+### 定投模拟（v2.2.0 新增）
+
+有K线数据时，可回算每月定投的收益表现：
+
+```python
+from scripts.fund_data import dca_simulate
+
+dca = dca_simulate(bars, monthly_amount=1000, years=1)
+# dca 返回:
+# {
+#   "total_invested": 12000,         # 总投入（元）
+#   "final_value": 13800,            # 最终市值（元）
+#   "total_return_pct": 15.0,        # 总收益率(%)
+#   "annualized_return": 15.0,       # 年化收益率(%)
+#   "n_months": 12,                  # 定投月数
+#   "avg_cost": 9.5,                 # 平均成本价
+#   "final_price": 12.0,             # 最终价格
+#   "profit": 1800,                  # 收益金额（元）
+#   "shares_accumulated": 1200,      # 累计份额
+#   "vs_lump_sum": {                 # vs一次性投入
+#       "lump_sum_return": 20.0,
+#       "dca_beat_lump_sum": False,  # 是否跑赢一次性投入
+#   },
+#   "detail": "定投12个月，投入12000元，市值13800元，收益率15%，跑输一次性投入(20%)",
+# }
+```
+
+当用户问"定投怎么样"、"适合定投吗"时，自动计算并展示定投与一次性投入对比。
 
 ### 主动基金结论模板
 
@@ -289,6 +475,7 @@ TOP10集中度：{holding_top_pct}%
 
 ## 后验复盘
 
+借助 `scripts.tracker` 的追踪记录：
 1. 每月检查：规模变化（连续3月下降>20%预警）、折溢价（>2%持续5日预警）
 2. 季度末检查：跟踪误差（>0.5%预警）、同类排名变化（跌出前50%预警）
 3. 基金经理变更时触发重新评估
@@ -298,6 +485,5 @@ TOP10集中度：{holding_top_pct}%
 
 ## 相关
 
-- [[a-stock-data]] — 个股行情数据（ETF重仓股扫描用）
 - [[magnus-secular-analysis]] — 个股长线分析
 - [[temp-omni-analysis]] — 个股短线分析
